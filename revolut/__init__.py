@@ -297,6 +297,8 @@ class ExternalCounterparty(_UpdateFromKwargsMixin):
     address = None
     iban = None
     bic = None
+    account_no = None
+    sort_code = None
 
     def __init__(self, **kwargs):
         self.client = kwargs.pop('client')
@@ -320,8 +322,12 @@ class ExternalCounterparty(_UpdateFromKwargsMixin):
             if iban_ctry.isalpha() and iban_ctry != self.bank_country:
                 raise ValueError('Bank country {} doesn\'t match the IBAN prefix {}'.format(
                         self.bank_country, iban_ctry))
-        keyset = ('email', 'phone', 'company_name', 'individual_name',
-                'bank_country', 'currency', 'phone', 'address', 'iban', 'bic')
+        keyset = (
+            'email', 'phone', 'company_name', 'individual_name',
+            'bank_country', 'currency', 'phone', 'address', 'iban', 'bic',
+            'account_no', 'sort_code'
+        )
+
         reqdata = {}
         for k in keyset:
             v = getattr(self, k, None)
