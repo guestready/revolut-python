@@ -16,6 +16,8 @@ __version__ = '0.6.1'
 
 _log = logging.getLogger(__name__)
 
+# Initial version
+
 
 class Client(utils._SetEnv):
     live = False
