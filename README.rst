@@ -10,7 +10,7 @@ Revolut API client for Python
 .. |coveralls| image:: https://coveralls.io/repos/github/emesik/revolut-python/badge.svg
 .. _coveralls: https://coveralls.io/github/emesik/revolut-python
 
-A Python wrapper for Revolut API, Python 2.x and 3.x compatible.
+Initial version of a Python wrapper for Revolut API, Python 2.x and 3.x compatible.
 
 Release 0.6.1, a working beta
 
