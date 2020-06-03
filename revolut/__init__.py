@@ -5,6 +5,7 @@ from decimal import Decimal
 import json
 import logging
 import requests
+import time
 try: # pragma: nocover
     from urllib.parse import urljoin, urlencode     # 3.x
 except ImportError: # pragma: nocover
@@ -28,7 +29,7 @@ class Client(utils._SetEnv):
         self._set_env(session.access_token)
         self._session = session
 
-    def _request(self, func, path, data=None):
+    def _request(self, func, path, data=None, retried=0):
         url = urljoin(self.base_url, path)
         hdr = {'Authorization': 'Bearer {}'.format(self._session.access_token)}
         _log.debug('{}'.format(path))
@@ -51,6 +52,18 @@ class Client(utils._SetEnv):
                     raise exceptions.CounterpartyAddressRequired(message)
                 elif 'ounterparty already exists' in message:
                     raise exceptions.CounterpartyAlreadyExists(message)
+
+            if rsp.status_code == 429:
+                # Add retry to avoid deep stack
+                if message == 'Request rate limit has been reached.' and retried < 5:
+                    time.sleep(60)
+                    return self._request(func, path, data, retried + 1)
+
+            # Unknown rsp code
+            if 'Oops! An error occurred while processing your request' in message and retried < 5:
+                time.sleep(1)
+                return self._request(func, path, data, retried + 1)
+
             raise exceptions.RevolutHttpError(rsp.status_code, message)
         if result:
             _ppresult = json.dumps(result, indent=2, sort_keys=True)
@@ -69,32 +82,21 @@ class Client(utils._SetEnv):
 
     @property
     def accounts(self):
-        if self._accounts is not None:
-            return self._accounts
-        self._accounts = {}
         data = self._get('accounts')
+        revolut_accounts = {}
         for accdat in data:
             acc = Account(client=self, **accdat)
-            self._accounts[acc.id] = acc
-        return self._accounts
+            revolut_accounts[acc.id] = acc
+        return revolut_accounts
 
     @property
     def counterparties(self):
-        if self._counterparties is not None:
-            return self._counterparties
-        self._counterparties = {}
-        self._cptbyaccount = {}
+        revolut_counterparties = {}
         data = self._get('counterparties')
         for cptdat in data:
             cpt = Counterparty(client=self, **cptdat)
-            self._counterparties[cpt.id] = cpt
-            for cptaccid in cpt.accounts.keys():
-                self._cptbyaccount[cptaccid] = cpt
-        return self._counterparties
-
-    def _refresh_counterparties(self):
-        self._counterparties = self._cptbyaccount = None
-        _ = self.counterparties
+            revolut_counterparties[cpt.id] = cpt
+        return revolut_counterparties
 
     def transactions(self, counterparty=None, from_date=None, to_date=None, txtype=None):
         transactions = []
@@ -106,9 +108,11 @@ class Client(utils._SetEnv):
         if to_date:
             reqdata['to'] = utils._date(to_date).isoformat()
         if txtype:
-            if txtype not in ('atm', 'card_payment', 'card_refund', 'card_chargeback',
+            if txtype not in (
+                'atm', 'card_payment', 'card_refund', 'card_chargeback',
                 'card_credit', 'exchange', 'transfer', 'loan', 'fee', 'refund', 'topup',
-                'topup_return', 'tax', 'tax_refund'):
+                'topup_return', 'tax', 'tax_refund'
+            ):
                 raise ValueError('Invalid transaction type: {}'.format(txtype))
             reqdata['type'] = txtype
         data = self._get('transactions', data=reqdata or None)
@@ -167,45 +171,45 @@ class Account(_UpdateFromKwargsMixin):
     def details(self):
         return self.client._get('accounts/{}/bank-details'.format(self.id))
 
-    def send(self, dest, amount, currency, request_id, reference=None):
+    def send_internal(self, revolut_account_id, amount, request_id, reference=None):
         amount = Decimal(amount)
         if not isinstance(request_id, utils._str_types) or len(request_id) > 40:
             raise ValueError('request_id must be a string of max. 40 chars')
-        destid = utils._obj2id(dest)
-        if destid in self.client.accounts \
-                and currency == self.currency == self.client.accounts[destid].currency:
-            return self._transfer_internal(destid, amount, request_id, reference)
-        try:
-            _ = self.client.counterparties  # NOTE: make sure counterparties are loaded
-            cpt = self.client._cptbyaccount[destid]
-        except KeyError:
-            raise ValueError('Account id {} not found among counterparties.'.format(destid))
-        if cpt.accounts[destid].currency != currency:
-            raise ValueError('Currency {} does not match the destination currency: {}'.format(
-                    currency, cpt.accounts[destid].currency))
+
+        reqdata = {
+            'request_id': request_id,
+            'source_account_id': self.id,
+            'target_account_id': revolut_account_id,
+            'amount': '{:.2f}'.format(amount),
+            'currency': self.currency
+        }
+
+        if reference is not None:
+            reqdata['reference'] = reference
+
+        data = self.client._post('transfer', reqdata)
+
+        return self.client.transaction(data['id'])
+
+    def send_external(self, counterparty_id, counterparty_account_id, amount, currency, request_id, reference=None):
+        amount = Decimal(amount)
+        if not isinstance(request_id, utils._str_types) or len(request_id) > 40:
+            raise ValueError('request_id must be a string of max. 40 chars')
+
         reqdata = {
             'request_id': request_id,
             'account_id': self.id,
             'receiver': {
-                'account_id': destid,
-                'counterparty_id': cpt.id},
+                'account_id': counterparty_account_id,
+                'counterparty_id': counterparty_id},
             'amount': '{:.2f}'.format(amount),
             'currency': currency}
-        if reference is not None:
-            reqdata['reference'] = reference
-        data = self.client._post('pay', reqdata)
-        return self.client.transaction(data['id'])
 
-    def _transfer_internal(self, destid, amount, request_id, reference):
-        reqdata = {
-            'request_id': request_id,
-            'source_account_id': self.id,
-            'target_account_id': destid,
-            'amount': '{:.2f}'.format(amount),
-            'currency': self.currency}
         if reference is not None:
             reqdata['reference'] = reference
-        data = self.client._post('transfer', reqdata)
+
+        data = self.client._post('pay', reqdata)
+
         return self.client.transaction(data['id'])
 
 
@@ -264,20 +268,18 @@ class Counterparty(_UpdateFromKwargsMixin):
         try:
             data = self.client._post(
                 'counterparty',
-                data = {k: getattr(self, k) for k in keyset})
+                data={k: getattr(self, k) for k in keyset})
         except exceptions.RevolutHttpError as e:
             if e.status_code == 422:
                 raise exceptions.CounterpartyAlreadyExists()
             raise
         self._update(**data)
-        self.client._refresh_counterparties()
         return self
 
     def delete(self):
         if not self.id:
             raise ValueError('{} doesn\'t have an ID. Cannot delete.'.format(self))
         self.client._delete('counterparty/{}'.format(self.id))
-        del self.client._counterparties[self.id]
         self.id = None
 
 
@@ -335,7 +337,6 @@ class ExternalCounterparty(_UpdateFromKwargsMixin):
                 reqdata[k] = v
         data = self.client._post('counterparty', data=reqdata)
         self.id = data['id']
-        self.client._refresh_counterparties()
         cpt = Counterparty(client=self.client, id=self.id)
         return cpt.refresh()
 
